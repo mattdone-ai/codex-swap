@@ -1,6 +1,6 @@
 # codex-swap (`xswap`)
 
-A CLI for running Codex under different ChatGPT accounts, with usage reporting, directory mappings, portable account backups and optional shared conversation history. Inspired by the `cswap run` workflow from [claude-swap](https://github.com/realiti4/claude-swap), using the permanent account-directory approach from [swapdex](https://github.com/youdie006/swapdex).
+A CLI for running Codex under different ChatGPT accounts, with usage reporting, directory mappings, portable account backups, optional shared conversation history and opt-in seamless rotation for a compatible Codext build. Inspired by the `cswap run` workflow from [claude-swap](https://github.com/realiti4/claude-swap), using the permanent account-directory approach from [swapdex](https://github.com/youdie006/swapdex).
 
 Save your current Codex login with `xswap add`, then use `xswap switch` to change the login used by a plain `codex` command. Saved accounts have private credential snapshots. The globally active account uses the main Codex home; explicit launches of other accounts use their separate homes. Codex owns token refresh.
 
@@ -184,6 +184,25 @@ xf() { x1 fork "$@"; }
 
 Account selection removes inherited `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` and `OPENAI_ACCESS_TOKEN` from the child environment. Registered accounts use Codex's file credential backend. Overrides of that backend, or of `sqlite_home` while sharing history, are rejected rather than silently changing the selected account or conversation store. Other Codex arguments are forwarded unchanged.
 
+## Run one seamless Codext session
+
+Seamless rotation is explicit and isolated from stock Codex. It requires a patched Codext build that implements the xswap managed-runtime credential lock contract. Configure its absolute path and verified SHA-256 digest without changing the executable used by ordinary `run`, `login`, or global switching:
+
+```sh
+xswap config set seamless-codext-bin /absolute/path/to/patched/codext
+xswap config set seamless-codext-sha256 VERIFIED_64_CHARACTER_SHA256
+xswap session
+xswap session -- resume SESSION_ID
+```
+
+`xswap session [ACCOUNT] -- [CODEXT_ARGS]` creates a persistent private runtime at `<xswap-data>/runtime/seamless`, seeds it from the selected account on first use, and launches the pinned binary. A later session resumes the runtime's active account; an explicit different account is refused once the runtime exists because live rotation owns that credential boundary. `xswap status` reports the global and seamless active accounts separately without reporting tokens.
+
+Automatic reload and parked usage-limit continuation are Codext TUI features. `xswap session` supports the interactive TUI and its `resume`/`fork` commands. xswap forces those sessions to use Codext's embedded patched backend, preventing a shared app-server daemon from replacing the pinned build through its updater. Commands that attach to a shared/remote daemon, as well as `exec` and `review`, are rejected. A foreground `app-server` remains available; it reloads a rotated account at the next turn boundary, while its clients still own quota-error retries.
+
+The runtime shares transcripts, archives, prompt history, session index, writer locks and user configuration with the main Codex home. Its SQLite databases stay local to the runtime, so a newer Codext cannot migrate the database used by stock Codex. Codext can still discover and resume closed stock sessions from the shared rollout files. Account credentials, logs and other runtime state remain isolated.
+
+The runtime contains a regular mode-0600 `.xswap-managed-runtime` marker with exact contents `v1` followed by a newline. xswap creates this marker only with a new private runtime and refuses to adopt an existing unmarked directory. xswap and compatible Codext builds serialize credential capture, refresh and activation with an exclusive advisory lock at `auth.json.xswap.lock`. xswap verifies the configured executable digest before every launch and forces file-based authentication. On Unix, the pinned artifact must have no write bits (mode `0555`); xswap holds that verified inode through `exec`, so an atomic path replacement cannot change the launched bytes. The companion Codext patch supplied in `contrib/codext/` supports this managed runtime on Unix and fails closed when the marker is present on Windows; ordinary unmarked Codext behavior and xswap's other Windows workflows remain supported. A stock or unpatched Codex build does not satisfy this contract and must not be launched through `xswap session`.
+
 ## Switch the global Codex login
 
 Exit existing Codex sessions, then switch:
@@ -260,6 +279,8 @@ polling loop:
 ```sh
 xswap auto --once --dry-run
 xswap auto --json
+xswap auto --seamless --once --dry-run
+xswap auto --seamless --json
 ```
 
 The default policy checks every 60 seconds. It triggers independently at 94%
@@ -286,6 +307,16 @@ switch is due while any Codex session is running the daemon emits
 `blocked-running-codex` and retries later. Exit all stock Codex sessions before
 the global account changes, then restart them. `--dry-run` never writes active
 credentials. JSON mode emits one object per line for service logs.
+
+`xswap auto --seamless` reads the active identity and current access token from
+the isolated runtime; inactive accounts still use their saved snapshots. On a
+switch, it holds the managed-runtime credential lock, saves the outgoing
+runtime credentials into that account's isolated saved home, and atomically
+installs the target snapshot into the runtime. The patched Codext reloads the
+new identity between turns and resumes a parked usage-limit continuation. It
+never writes the main `~/.codex/auth.json`, bypasses the stock process guard, or
+kills a Codex process. A concurrent Codext token refresh produces a retryable
+busy result, and the next poll reevaluates fresh credentials and quota state.
 
 A user-service template is provided at `contrib/xswap-auto.service`. Copy it to
 `~/.config/systemd/user/`, then use `systemctl --user daemon-reload` and
@@ -361,7 +392,7 @@ xswap remove work
 
 Reauthentication shows the expected saved account and opens a fresh Codex sign-in. Choosing the wrong browser account or cancelling leaves existing credentials unchanged. Retry the same `xswap login ACCOUNT` command and select the intended account; this also repairs a saved home left with another account’s credentials by an older version. A successful sign-in preserves the slot, alias and mappings.
 
-Reauthentication works while Codex sessions on that account keep running: the new login replaces the same account's credentials, and running sessions pick it up the next time they refresh their token. Replacing a main-home login that belongs to a different account still requires existing Codex processes to be closed first. Removal also works while that account's sessions run, since it keeps the account's files. Other accounts remain available during login.
+Reauthentication works while Codex sessions on that account keep running: the new login replaces the same account's credentials, and running sessions pick it up the next time they refresh their token. When that account is active in the managed seamless runtime, the same auth lock also updates the runtime copy so a later rotation cannot restore older credentials. Replacing a main-home login that belongs to a different account still requires existing Codex processes to be closed first. Removal also works while that account's sessions run, since it keeps the account's files. Other accounts remain available during login.
 
 `remove` unregisters the account and prints its retained directory. It does **not** delete credentials or history, and does not log out Codex. Removing the selected launch default returns future launches to the saved original account when available. Removal does not rewrite the installed global login. Slot numbers are not automatically reused.
 
@@ -377,7 +408,7 @@ xswap config unset codex-bin
 xswap config unset default-account
 ```
 
-The supported preferences are `codex-bin` (default `codex`) and `default-account` (default `default`, the saved original account). Preferences live in the registry shown by `config path`. `config set default-account ACCOUNT` performs the same global switch as `xswap switch ACCOUNT`, including its running-Codex guard. `config unset default-account` switches back to the saved original account. The preference stores a slot so renames and moves keep selecting the same account. `config get` and `config list` show the saved preference or its default. For launches/login, executable selection is `--codex-bin`, then `XSWAP_CODEX_BIN`, then the saved preference, then `codex` on PATH. A relative executable path saved by `config set` is resolved when you set it.
+The supported preferences are `codex-bin` (default `codex`), `default-account` (default `default`, the saved original account), `seamless-codext-bin`, and `seamless-codext-sha256`. Preferences live in the registry shown by `config path`. `config set default-account ACCOUNT` performs the same global switch as `xswap switch ACCOUNT`, including its running-Codex guard. `config unset default-account` switches back to the saved original account. The preference stores a slot so renames and moves keep selecting the same account. `config get` and `config list` show the saved preference or its default. For launches/login, executable selection is `--codex-bin`, then `XSWAP_CODEX_BIN`, then the saved preference, then `codex` on PATH. A relative executable path saved by `config set` is resolved when you set it. Seamless sessions require both Codext preferences and execute the exact file whose digest was verified.
 
 To erase xswap’s registry, preferences, mappings and managed account credentials/history:
 
@@ -434,7 +465,7 @@ Every response has `schemaVersion: 1`. `list` contains `accounts`; `add` contain
 
 xswap follows Codex's authentication-mode precedence: explicit `chatgpt` permits stored credentials for other modes, but a missing/null mode with a non-null API key, personal access token, or Bedrock credential is rejected. Legacy ChatGPT files with missing/null mode and missing/null material for those other modes remain supported. `list` marks incompatible saved snapshots `invalid_credentials`. Incompatible main-home authentication makes `status` and `switch` return an authentication error. Use `xswap login <slot-or-alias>` to sign in with the registered ChatGPT identity. Credentials and account metadata stay in place until a verified login succeeds.
 
-`usage` performs an on-demand request. xswap runs no daemon or proxy and does not automatically switch accounts near quota limits. Continuous polling and automatic switching policy can remain in a consuming application such as gxserver. A consumer switches a session by stopping that session at an appropriate point, then launching the chosen account with `resume` and the same session ID.
+`usage` performs an on-demand request. Automatic switching runs only when `xswap auto` is explicitly started or its optional user service is enabled. `contrib/xswap-auto.service` remains the stock global-switch service; install `contrib/xswap-seamless.service` for the managed Codext runtime. Stock global switching retains its running-process guard; seamless switching requires the isolated patched-Codext workflow above.
 
 ## Storage and authentication scope
 
@@ -445,6 +476,8 @@ On macOS/Linux, the registry defaults to `$XDG_DATA_HOME/codex-swap` when `XDG_D
 | `--data-dir` / `XSWAP_HOME` | Separate xswap registry and managed homes |
 | `--codex-home` / `XSWAP_CODEX_HOME` | Main Codex login, configuration and history home |
 | `--codex-bin` / `XSWAP_CODEX_BIN` | Codex executable, default `codex` on PATH |
+| `seamless-codext-bin` preference | Absolute patched Codext executable used only by `xswap session` |
+| `seamless-codext-sha256` preference | Required SHA-256 pin verified before every seamless launch |
 
 On first use, the main home defaults to `CODEX_HOME`, then `~/.codex` (`%USERPROFILE%\.codex` on Windows). It is persisted on the first registry mutation, so an inherited account-specific `CODEX_HOME` does not subsequently move the sharing anchor. A different explicit main home requires a different registry.
 

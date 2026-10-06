@@ -190,6 +190,7 @@ pub(crate) fn commit_login(
         );
     }
     store.ensure_unique_identity(&identity, account.number)?;
+    let runtime_login = crate::seamless::active_login_guard(&store, &account)?;
     if !destination.concurrent {
         crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
     }
@@ -207,6 +208,9 @@ pub(crate) fn commit_login(
     let result = (|| {
         for (path, _) in &destination.previous {
             transaction.write(path, document)?;
+        }
+        if let Some(runtime) = &runtime_login {
+            transaction.write(&runtime.path, document)?;
         }
         account.identity = Some(identity);
         let entry = store
@@ -573,7 +577,7 @@ fn select_global_impl(
     transaction.finish(result)
 }
 
-fn validate_activation_guard(
+pub(crate) fn validate_activation_guard(
     store: &Store,
     source: &auth::Identity,
     guard: &ActivationGuard,

@@ -1,0 +1,934 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index baab9c0..e59f5b9 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -3808,6 +3808,7 @@ dependencies = [
+  "http 1.4.0",
+  "jsonwebtoken",
+  "keyring",
++ "libc",
+  "once_cell",
+  "os_info",
+  "pretty_assertions",
+diff --git a/codex-rs/login/Cargo.toml b/codex-rs/login/Cargo.toml
+index 8772f46..c69c580 100644
+--- a/codex-rs/login/Cargo.toml
++++ b/codex-rs/login/Cargo.toml
+@@ -23,6 +23,7 @@ codex-terminal-detection = { workspace = true }
+ codex-utils-template = { workspace = true }
+ codex-workload-identity = { workspace = true }
+ http = { workspace = true }
++libc = { workspace = true }
+ once_cell = { workspace = true }
+ os_info = { workspace = true }
+ rand = { workspace = true }
+diff --git a/codex-rs/login/src/auth/manager.rs b/codex-rs/login/src/auth/manager.rs
+index e233b17..78eedb1 100644
+--- a/codex-rs/login/src/auth/manager.rs
++++ b/codex-rs/login/src/auth/manager.rs
+@@ -1,4 +1,5 @@
+ mod workspace_routing;
++mod xswap_lock;
+ 
+ use chrono::Utc;
+ use http::StatusCode;
+@@ -1862,7 +1863,9 @@ enum UnauthorizedRecoveryMode {
+ // For API key based authentication, we don't do anything and let the error bubble to the user.
+ //
+ // For ChatGPT based authentication, we:
+-// 1. Attempt to reload the auth data from disk. We only reload if the account id matches the one the current process is running as.
++// 1. Attempt to reload the auth data from disk. We only reload if the account id matches the one
++//    the current process is running as, except that an xswap-managed runtime accepts a complete
++//    account change while holding xswap's process-shared auth lock.
+ // 2. Attempt to refresh the token using OAuth token refresh flow.
+ // If after both steps the server still responds with 401 we let the error bubble to the user.
+ //
+@@ -1996,7 +1999,7 @@ impl UnauthorizedRecovery {
+                 match self
+                     .manager
+                     .reload_if_account_id_matches(self.expected_account_id.as_deref())
+-                    .await
++                    .await?
+                 {
+                     ReloadOutcome::ReloadedChanged => {
+                         self.step = UnauthorizedRecoveryStep::RefreshToken;
+@@ -2520,12 +2523,15 @@ impl AuthManager {
+     async fn reload_if_account_id_matches(
+         &self,
+         expected_account_id: Option<&str>,
+-    ) -> ReloadOutcome {
++    ) -> Result<ReloadOutcome, RefreshTokenError> {
++        let managed_lock = xswap_lock::acquire(&self.codex_home)
++            .await
++            .map_err(RefreshTokenError::Transient)?;
+         let expected_account_id = match expected_account_id {
+             Some(account_id) => account_id,
+             None => {
+                 tracing::info!("Skipping auth reload because no account id is available.");
+-                return ReloadOutcome::Skipped;
++                return Ok(ReloadOutcome::Skipped);
+             }
+         };
+ 
+@@ -2533,11 +2539,16 @@ impl AuthManager {
+         let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
+ 
+         if new_account_id.as_deref() != Some(expected_account_id) {
++            if managed_lock.is_locked() && new_account_id.is_some() {
++                tracing::info!("Reloading changed account from xswap's managed auth snapshot.");
++                self.set_cached_auth(new_auth);
++                return Ok(ReloadOutcome::ReloadedChanged);
++            }
+             let found_account_id = new_account_id.as_deref().unwrap_or("unknown");
+             tracing::info!(
+                 "Skipping auth reload due to account id mismatch (expected: {expected_account_id}, found: {found_account_id})"
+             );
+-            return ReloadOutcome::Skipped;
++            return Ok(ReloadOutcome::Skipped);
+         }
+ 
+         tracing::info!("Reloading auth for account {expected_account_id}");
+@@ -2546,9 +2557,9 @@ impl AuthManager {
+             !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
+         self.set_cached_auth(new_auth);
+         if auth_changed {
+-            ReloadOutcome::ReloadedChanged
++            Ok(ReloadOutcome::ReloadedChanged)
+         } else {
+-            ReloadOutcome::ReloadedNoChange
++            Ok(ReloadOutcome::ReloadedNoChange)
+         }
+     }
+ 
+@@ -2909,7 +2920,7 @@ impl AuthManager {
+ 
+         match self
+             .reload_if_account_id_matches(expected_account_id.as_deref())
+-            .await
++            .await?
+         {
+             ReloadOutcome::ReloadedChanged => {
+                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
+@@ -3138,6 +3149,33 @@ impl AuthManager {
+         auth: &ChatgptAuth,
+         refresh_token: String,
+     ) -> Result<(), RefreshTokenError> {
++        let managed_lock = xswap_lock::acquire(&self.codex_home)
++            .await
++            .map_err(RefreshTokenError::Transient)?;
++        if managed_lock.is_locked() {
++            let expected_tokens = auth.current_token_data().ok_or_else(|| {
++                RefreshTokenError::Transient(std::io::Error::other("Token data is not available."))
++            })?;
++            let stored_tokens = auth
++                .storage()
++                .load()
++                .map_err(RefreshTokenError::Transient)?
++                .and_then(|stored| {
++                    (stored.resolved_mode() == AuthMode::Chatgpt)
++                        .then_some(stored.tokens)
++                        .flatten()
++                });
++            if stored_tokens.as_ref() != Some(&expected_tokens)
++                || expected_tokens.refresh_token != refresh_token
++            {
++                tracing::info!(
++                    "Skipping token refresh because xswap changed the managed auth snapshot."
++                );
++                self.reload().await;
++                return Ok(());
++            }
++        }
++
+         let refresh_response = request_chatgpt_token_refresh(refresh_token, auth.client()).await?;
+ 
+         persist_tokens(
+diff --git a/codex-rs/login/src/auth/manager/xswap_lock.rs b/codex-rs/login/src/auth/manager/xswap_lock.rs
+new file mode 100644
+index 0000000..7a88703
+--- /dev/null
++++ b/codex-rs/login/src/auth/manager/xswap_lock.rs
+@@ -0,0 +1,177 @@
++use std::fs::File;
++#[cfg(unix)]
++use std::fs::OpenOptions;
++use std::io;
++use std::path::Path;
++
++#[cfg(unix)]
++use std::io::Read;
++#[cfg(unix)]
++use std::os::unix::fs::MetadataExt;
++#[cfg(unix)]
++use std::os::unix::fs::OpenOptionsExt;
++
++const MANAGED_RUNTIME_MARKER: &str = ".xswap-managed-runtime";
++#[cfg(unix)]
++const MANAGED_RUNTIME_MARKER_CONTENTS: &[u8] = b"v1\n";
++#[cfg(unix)]
++const MANAGED_RUNTIME_LOCK: &str = "auth.json.xswap.lock";
++
++/// Holds xswap's process-shared auth lock when the current Codex home opts in.
++/// Dropping the file releases the advisory lock.
++pub(super) enum ManagedRefreshLock {
++    Unmanaged,
++    Locked { _file: File },
++}
++
++impl ManagedRefreshLock {
++    pub(super) fn is_locked(&self) -> bool {
++        matches!(self, Self::Locked { .. })
++    }
++}
++
++pub(super) async fn acquire(codex_home: &Path) -> io::Result<ManagedRefreshLock> {
++    let codex_home = codex_home.to_path_buf();
++    tokio::task::spawn_blocking(move || acquire_blocking(&codex_home))
++        .await
++        .map_err(|error| io::Error::other(format!("xswap auth lock task failed: {error}")))?
++}
++
++fn acquire_blocking(codex_home: &Path) -> io::Result<ManagedRefreshLock> {
++    #[cfg(unix)]
++    {
++        acquire_blocking_unix(codex_home)
++    }
++    #[cfg(windows)]
++    {
++        acquire_blocking_windows(codex_home)
++    }
++    #[cfg(not(any(unix, windows)))]
++    {
++        let marker_path = codex_home.join(MANAGED_RUNTIME_MARKER);
++        match std::fs::symlink_metadata(&marker_path) {
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {
++                Ok(ManagedRefreshLock::Unmanaged)
++            }
++            Ok(_) => Err(io::Error::other(
++                "xswap managed runtime auth locking is unsupported on this platform",
++            )),
++            Err(error) => Err(managed_runtime_error("cannot inspect marker", error)),
++        }
++    }
++}
++
++#[cfg(unix)]
++fn acquire_blocking_unix(codex_home: &Path) -> io::Result<ManagedRefreshLock> {
++    let marker_path = codex_home.join(MANAGED_RUNTIME_MARKER);
++    let mut marker_options = OpenOptions::new();
++    marker_options
++        .read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
++    let mut marker_file = match marker_options.open(&marker_path) {
++        Ok(file) => file,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => {
++            return Ok(ManagedRefreshLock::Unmanaged);
++        }
++        Err(error) => return Err(managed_runtime_error("cannot open marker", error)),
++    };
++
++    validate_private_home(codex_home)?;
++    let marker_metadata = marker_file
++        .metadata()
++        .map_err(|error| managed_runtime_error("cannot inspect marker", error))?;
++    validate_private_file(&marker_metadata, "managed-runtime marker")?;
++
++    let mut marker_contents = Vec::new();
++    marker_file
++        .read_to_end(&mut marker_contents)
++        .map_err(|error| managed_runtime_error("cannot read marker", error))?;
++    if marker_contents != MANAGED_RUNTIME_MARKER_CONTENTS {
++        return Err(io::Error::other(
++            "invalid xswap managed-runtime marker: expected version v1",
++        ));
++    }
++
++    let lock_path = codex_home.join(MANAGED_RUNTIME_LOCK);
++    let lock_file = open_private_lock_file(&lock_path)?;
++    let lock_metadata = lock_file
++        .metadata()
++        .map_err(|error| managed_runtime_error("cannot inspect auth lock", error))?;
++    validate_private_file(&lock_metadata, "auth lock")?;
++    lock_file
++        .lock()
++        .map_err(|error| managed_runtime_error("cannot acquire auth lock", error))?;
++
++    Ok(ManagedRefreshLock::Locked { _file: lock_file })
++}
++
++#[cfg(windows)]
++fn acquire_blocking_windows(codex_home: &Path) -> io::Result<ManagedRefreshLock> {
++    let marker_path = codex_home.join(MANAGED_RUNTIME_MARKER);
++    match std::fs::symlink_metadata(&marker_path) {
++        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ManagedRefreshLock::Unmanaged),
++        Ok(_) => Err(io::Error::other(
++            "xswap managed runtime auth locking is unsupported on Windows",
++        )),
++        Err(error) => Err(managed_runtime_error("cannot inspect marker", error)),
++    }
++}
++
++#[cfg(unix)]
++fn open_private_lock_file(path: &Path) -> io::Result<File> {
++    let mut options = OpenOptions::new();
++    options
++        .read(true)
++        .write(true)
++        .create(true)
++        .mode(0o600)
++        .custom_flags(libc::O_NOFOLLOW);
++    options
++        .open(path)
++        .map_err(|error| managed_runtime_error("cannot open auth lock", error))
++}
++
++#[cfg(unix)]
++fn validate_private_home(codex_home: &Path) -> io::Result<()> {
++    let metadata = std::fs::symlink_metadata(codex_home)
++        .map_err(|error| managed_runtime_error("cannot inspect CODEX_HOME", error))?;
++    if !metadata.file_type().is_dir() {
++        return Err(io::Error::other(
++            "invalid xswap managed runtime: CODEX_HOME must be a real directory",
++        ));
++    }
++    if metadata.uid() != effective_user_id() || metadata.mode() & 0o077 != 0 {
++        return Err(io::Error::other(
++            "invalid xswap managed runtime: CODEX_HOME must be owned by the effective user and not accessible by group or others",
++        ));
++    }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn validate_private_file(metadata: &std::fs::Metadata, name: &str) -> io::Result<()> {
++    if !metadata.file_type().is_file() {
++        return Err(io::Error::other(format!(
++            "invalid xswap {name}: expected a regular file"
++        )));
++    }
++    if metadata.uid() != effective_user_id() || metadata.mode() & 0o777 != 0o600 {
++        return Err(io::Error::other(format!(
++            "invalid xswap {name}: expected effective-user ownership and permissions 0600"
++        )));
++    }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn effective_user_id() -> u32 {
++    // SAFETY: geteuid has no preconditions and does not dereference pointers.
++    unsafe { libc::geteuid() }
++}
++
++fn managed_runtime_error(operation: &str, error: io::Error) -> io::Error {
++    io::Error::new(
++        error.kind(),
++        format!("xswap managed runtime {operation}: {error}"),
++    )
++}
+diff --git a/codex-rs/login/tests/suite/auth_refresh.rs b/codex-rs/login/tests/suite/auth_refresh.rs
+index 5e353de..f8c5420 100644
+--- a/codex-rs/login/tests/suite/auth_refresh.rs
++++ b/codex-rs/login/tests/suite/auth_refresh.rs
+@@ -24,7 +24,14 @@ use pretty_assertions::assert_eq;
+ use serde::Serialize;
+ use serde_json::json;
+ use std::ffi::OsString;
++use std::fs::File;
++use std::fs::OpenOptions;
+ use std::net::TcpListener;
++#[cfg(unix)]
++use std::os::unix::fs::OpenOptionsExt;
++#[cfg(unix)]
++use std::os::unix::fs::PermissionsExt;
++use std::path::Path;
+ use std::process::Command;
+ use std::sync::Arc;
+ use std::time::Duration as StdDuration;
+@@ -37,6 +44,8 @@ use wiremock::matchers::path;
+ 
+ const INITIAL_ACCESS_TOKEN: &str = "initial-access-token";
+ const INITIAL_REFRESH_TOKEN: &str = "initial-refresh-token";
++const XSWAP_MANAGED_RUNTIME_MARKER: &str = ".xswap-managed-runtime";
++const XSWAP_AUTH_LOCK: &str = "auth.json.xswap.lock";
+ const SYSTEM_PROXY_TEST_ENDPOINT: &str = "http://auth-proxy.invalid/oauth/token";
+ const SYSTEM_PROXY_TEST_SUBPROCESS_ENV_VAR: &str = "CODEX_AUTH_SYSTEM_PROXY_TEST_SUBPROCESS";
+ const SYSTEM_PROXY_TEST_PROXY_URL_ENV_VAR: &str = "CODEX_AUTH_SYSTEM_PROXY_TEST_PROXY_URL";
+@@ -258,6 +267,424 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(unix)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_managed_refresh_updates_same_account() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++            "access_token": "managed-access-token",
++            "refresh_token": "managed-refresh-token"
++        })))
++        .expect(1)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    enable_xswap_managed_runtime(ctx.codex_home.path())?;
++    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
++    let initial_auth = chatgpt_auth(initial_tokens.clone());
++    ctx.write_auth(&initial_auth).await?;
++
++    ctx.auth_manager.refresh_token_from_authority().await?;
++
++    let expected_tokens = TokenData {
++        access_token: "managed-access-token".to_string(),
++        refresh_token: "managed-refresh-token".to_string(),
++        ..initial_tokens
++    };
++    let stored = ctx.load_auth()?;
++    assert_eq!(stored.tokens, Some(expected_tokens.clone()));
++    let cached = ctx
++        .auth_manager
++        .auth_cached()
++        .context("managed auth should remain cached")?
++        .get_token_data()?;
++    assert_eq!(cached, expected_tokens);
++
++    server.verify().await;
++    Ok(())
++}
++
++#[cfg(unix)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_unauthorized_recovery_accepts_switched_account_without_network_or_write()
++-> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(ResponseTemplate::new(500))
++        .expect(0)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    enable_xswap_managed_runtime(ctx.codex_home.path())?;
++    let initial_auth = chatgpt_auth(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN));
++    ctx.write_auth(&initial_auth).await?;
++
++    let mut switched_tokens = build_tokens("switched-access-token", "switched-refresh-token");
++    switched_tokens.account_id = Some("switched-account".to_string());
++    let switched_auth = chatgpt_auth(switched_tokens.clone());
++    save_auth(
++        ctx.codex_home.path(),
++        &switched_auth,
++        AuthCredentialsStoreMode::File,
++        AuthKeyringBackendKind::default(),
++    )?;
++
++    let mut recovery = ctx.auth_manager.unauthorized_recovery();
++    let outcome = recovery.next().await?;
++
++    assert_eq!(outcome.auth_state_changed(), Some(true));
++    assert_eq!(ctx.load_auth()?, switched_auth);
++    let cached = ctx
++        .auth_manager
++        .auth_cached()
++        .context("switched auth should be cached")?
++        .get_token_data()?;
++    assert_eq!(cached, switched_tokens);
++    server.verify().await;
++    Ok(())
++}
++
++#[cfg(unix)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_switch_waits_for_refresh_persistence_before_replacing_auth() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .set_delay(StdDuration::from_millis(500))
++                .set_body_json(json!({
++                    "access_token": "refreshed-before-switch-access-token",
++                    "refresh_token": "refreshed-before-switch-refresh-token"
++                })),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    enable_xswap_managed_runtime(ctx.codex_home.path())?;
++    let initial_auth = chatgpt_auth(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN));
++    ctx.write_auth(&initial_auth).await?;
++
++    let refresh_manager = Arc::clone(&ctx.auth_manager);
++    let refresh_task =
++        tokio::spawn(async move { refresh_manager.refresh_token_from_authority().await });
++    tokio::time::timeout(StdDuration::from_secs(5), async {
++        loop {
++            if !server
++                .received_requests()
++                .await
++                .unwrap_or_default()
++                .is_empty()
++            {
++                break;
++            }
++            tokio::time::sleep(StdDuration::from_millis(10)).await;
++        }
++    })
++    .await
++    .context("refresh request should reach the auth server")?;
++
++    let codex_home = ctx.codex_home.path().to_path_buf();
++    let switched_auth = chatgpt_auth(build_tokens(
++        "switched-after-refresh-access-token",
++        "switched-after-refresh-refresh-token",
++    ));
++    let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
++    let switch_task = tokio::task::spawn_blocking(move || -> Result<AuthDotJson> {
++        let lock = open_xswap_lock(&codex_home)?;
++        lock.lock()?;
++        acquired_tx.send(()).ok();
++        let observed = load_auth_dot_json(
++            &codex_home,
++            AuthCredentialsStoreMode::File,
++            AuthKeyringBackendKind::default(),
++        )?
++        .context("auth should exist before switch")?;
++        save_auth(
++            &codex_home,
++            &switched_auth,
++            AuthCredentialsStoreMode::File,
++            AuthKeyringBackendKind::default(),
++        )?;
++        Ok(observed)
++    });
++
++    assert!(
++        tokio::time::timeout(StdDuration::from_millis(100), &mut acquired_rx)
++            .await
++            .is_err(),
++        "switch should wait while token refresh holds the managed auth lock"
++    );
++    refresh_task.await.context("refresh task should join")??;
++    acquired_rx
++        .await
++        .context("switch should acquire the auth lock after refresh")?;
++    let observed_before_switch = switch_task.await.context("switch task should join")??;
++    assert_eq!(
++        observed_before_switch
++            .tokens
++            .context("refreshed auth should have tokens")?
++            .refresh_token,
++        "refreshed-before-switch-refresh-token"
++    );
++    assert_eq!(
++        ctx.load_auth()?
++            .tokens
++            .context("switched auth should have tokens")?
++            .refresh_token,
++        "switched-after-refresh-refresh-token"
++    );
++
++    server.verify().await;
++    Ok(())
++}
++
++#[cfg(unix)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_invalid_marker_fails_closed_before_refresh_network() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(ResponseTemplate::new(500))
++        .expect(0)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    set_private_directory_permissions(ctx.codex_home.path())?;
++    let marker = ctx.codex_home.path().join(XSWAP_MANAGED_RUNTIME_MARKER);
++    std::fs::write(&marker, b"unknown\n")?;
++    set_private_file_permissions(&marker)?;
++    let initial_auth = chatgpt_auth(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN));
++    ctx.write_auth(&initial_auth).await?;
++
++    let error = ctx
++        .auth_manager
++        .refresh_token_from_authority()
++        .await
++        .err()
++        .context("invalid marker should reject refresh")?;
++    assert!(matches!(error, RefreshTokenError::Transient(_)));
++    assert!(format!("{error}").contains("invalid xswap managed-runtime marker"));
++    assert_eq!(ctx.load_auth()?, initial_auth);
++
++    server.verify().await;
++    Ok(())
++}
++
++#[cfg(unix)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_marker_fifo_fails_closed_without_blocking() -> Result<()> {
++    use std::ffi::CString;
++    use std::os::unix::ffi::OsStrExt;
++
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(ResponseTemplate::new(500))
++        .expect(0)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    set_private_directory_permissions(ctx.codex_home.path())?;
++    let marker = ctx.codex_home.path().join(XSWAP_MANAGED_RUNTIME_MARKER);
++    let marker_c = CString::new(marker.as_os_str().as_bytes())?;
++    // SAFETY: marker_c is a valid, NUL-terminated path and mkfifo does not retain it.
++    if unsafe { libc::mkfifo(marker_c.as_ptr(), 0o600) } != 0 {
++        return Err(std::io::Error::last_os_error().into());
++    }
++    let initial_auth = chatgpt_auth(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN));
++    ctx.write_auth(&initial_auth).await?;
++
++    let error = tokio::time::timeout(
++        StdDuration::from_secs(1),
++        ctx.auth_manager.refresh_token_from_authority(),
++    )
++    .await
++    .context("FIFO marker validation should return without waiting for a writer")?
++    .err()
++    .context("FIFO marker should reject refresh")?;
++    assert!(matches!(error, RefreshTokenError::Transient(_)));
++    assert!(format!("{error}").contains("expected a regular file"));
++    assert_eq!(ctx.load_auth()?, initial_auth);
++
++    server.verify().await;
++    Ok(())
++}
++
++#[cfg(windows)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_managed_runtime_fails_closed_on_windows() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(ResponseTemplate::new(500))
++        .expect(0)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    let marker = ctx.codex_home.path().join(XSWAP_MANAGED_RUNTIME_MARKER);
++    std::fs::write(&marker, b"v1\n")?;
++    let initial_auth = chatgpt_auth(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN));
++    ctx.write_auth(&initial_auth).await?;
++
++    let error = ctx
++        .auth_manager
++        .refresh_token_from_authority()
++        .await
++        .err()
++        .context("managed runtime should reject refresh on Windows")?;
++    assert!(matches!(error, RefreshTokenError::Transient(_)));
++    assert!(format!("{error}").contains("unsupported on Windows"));
++    assert_eq!(ctx.load_auth()?, initial_auth);
++
++    server.verify().await;
++    Ok(())
++}
++
++#[cfg(unix)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_marker_symlink_fails_closed_before_refresh_network() -> Result<()> {
++    use std::os::unix::fs::symlink;
++
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(ResponseTemplate::new(500))
++        .expect(0)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    set_private_directory_permissions(ctx.codex_home.path())?;
++    let marker_target = ctx.codex_home.path().join("marker-target");
++    std::fs::write(&marker_target, b"v1\n")?;
++    set_private_file_permissions(&marker_target)?;
++    symlink(
++        &marker_target,
++        ctx.codex_home.path().join(XSWAP_MANAGED_RUNTIME_MARKER),
++    )?;
++    let initial_auth = chatgpt_auth(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN));
++    ctx.write_auth(&initial_auth).await?;
++
++    let error = ctx
++        .auth_manager
++        .refresh_token_from_authority()
++        .await
++        .err()
++        .context("symlink marker should reject refresh")?;
++    assert!(matches!(error, RefreshTokenError::Transient(_)));
++    assert!(format!("{error}").contains("cannot open marker"));
++    assert_eq!(ctx.load_auth()?, initial_auth);
++
++    server.verify().await;
++    Ok(())
++}
++
++#[cfg(unix)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_lock_symlink_fails_closed_before_refresh_network() -> Result<()> {
++    use std::os::unix::fs::symlink;
++
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(ResponseTemplate::new(500))
++        .expect(0)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    enable_xswap_managed_runtime(ctx.codex_home.path())?;
++    let lock_target = ctx.codex_home.path().join("lock-target");
++    File::create(&lock_target)?;
++    set_private_file_permissions(&lock_target)?;
++    symlink(&lock_target, ctx.codex_home.path().join(XSWAP_AUTH_LOCK))?;
++    let initial_auth = chatgpt_auth(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN));
++    ctx.write_auth(&initial_auth).await?;
++
++    let error = ctx
++        .auth_manager
++        .refresh_token_from_authority()
++        .await
++        .err()
++        .context("symlink lock should reject refresh")?;
++    assert!(matches!(error, RefreshTokenError::Transient(_)));
++    assert!(format!("{error}").contains("cannot open auth lock"));
++    assert_eq!(ctx.load_auth()?, initial_auth);
++
++    server.verify().await;
++    Ok(())
++}
++
++#[cfg(unix)]
++#[serial_test::serial(auth_env)]
++#[tokio::test]
++async fn xswap_marker_with_unsafe_mode_fails_closed_before_refresh_network() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/oauth/token"))
++        .respond_with(ResponseTemplate::new(500))
++        .expect(0)
++        .mount(&server)
++        .await;
++
++    let ctx = RefreshTokenTestContext::new(&server).await?;
++    enable_xswap_managed_runtime(ctx.codex_home.path())?;
++    let marker = ctx.codex_home.path().join(XSWAP_MANAGED_RUNTIME_MARKER);
++    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644))?;
++    let initial_auth = chatgpt_auth(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN));
++    ctx.write_auth(&initial_auth).await?;
++
++    let error = ctx
++        .auth_manager
++        .refresh_token_from_authority()
++        .await
++        .err()
++        .context("unsafe marker permissions should reject refresh")?;
++    assert!(matches!(error, RefreshTokenError::Transient(_)));
++    assert!(format!("{error}").contains("permissions 0600"));
++    assert_eq!(ctx.load_auth()?, initial_auth);
++
++    server.verify().await;
++    Ok(())
++}
++
+ #[serial_test::serial(auth_env)]
+ #[tokio::test]
+ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
+@@ -1623,6 +2050,56 @@ fn access_token_with_expiration(expires_at: chrono::DateTime<Utc>) -> String {
+     jwt_with_payload(json!({ "sub": "user-123", "exp": expires_at.timestamp() }))
+ }
+ 
++fn chatgpt_auth(tokens: TokenData) -> AuthDotJson {
++    AuthDotJson {
++        auth_mode: Some(AuthMode::Chatgpt),
++        openai_api_key: None,
++        tokens: Some(tokens),
++        last_refresh: Some(Utc::now() - Duration::days(1)),
++        agent_identity: None,
++        personal_access_token: None,
++        bedrock_api_key: None,
++        bedrock_access_keys: None,
++    }
++}
++
++fn enable_xswap_managed_runtime(codex_home: &Path) -> Result<()> {
++    set_private_directory_permissions(codex_home)?;
++    let marker = codex_home.join(XSWAP_MANAGED_RUNTIME_MARKER);
++    std::fs::write(&marker, b"v1\n")?;
++    set_private_file_permissions(&marker)
++}
++
++fn open_xswap_lock(codex_home: &Path) -> Result<File> {
++    let mut options = OpenOptions::new();
++    options.read(true).write(true).create(true);
++    #[cfg(unix)]
++    options.mode(0o600);
++    Ok(options.open(codex_home.join(XSWAP_AUTH_LOCK))?)
++}
++
++#[cfg(unix)]
++fn set_private_directory_permissions(path: &Path) -> Result<()> {
++    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn set_private_directory_permissions(_path: &Path) -> Result<()> {
++    Ok(())
++}
++
++#[cfg(unix)]
++fn set_private_file_permissions(path: &Path) -> Result<()> {
++    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn set_private_file_permissions(_path: &Path) -> Result<()> {
++    Ok(())
++}
++
+ fn build_tokens(access_token: &str, refresh_token: &str) -> TokenData {
+     let id_token = IdTokenInfo {
+         raw_jwt: minimal_jwt(),
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+index 135c411..2ee8237 100644
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -23,6 +23,7 @@ pub(crate) async fn make_test_app() -> App {
+         session_telemetry,
+         app_event_tx,
+         chat_widget,
++        _auth_watch: None,
+         workspace_command_runner: None,
+         launch_cwd: config.cwd.to_path_buf(),
+         runtime_working_directory_override: None,
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 9c1af27..3857ba6 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -6001,6 +6001,7 @@ async fn make_test_app() -> Box<App> {
+         session_telemetry,
+         app_event_tx,
+         chat_widget,
++        _auth_watch: None,
+         workspace_command_runner: None,
+         launch_cwd: config.cwd.to_path_buf(),
+         runtime_working_directory_override: None,
+@@ -6118,6 +6119,7 @@ pub(super) async fn make_test_app_with_channels() -> (
+             session_telemetry,
+             app_event_tx,
+             chat_widget,
++            _auth_watch: None,
+             workspace_command_runner: None,
+             launch_cwd: config.cwd.to_path_buf(),
+             runtime_working_directory_override: None,
+diff --git a/codex-rs/tui/src/chatwidget/tests/rate_limit_recovery_tests.rs b/codex-rs/tui/src/chatwidget/tests/rate_limit_recovery_tests.rs
+index 53d6182..774179d 100644
+--- a/codex-rs/tui/src/chatwidget/tests/rate_limit_recovery_tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests/rate_limit_recovery_tests.rs
+@@ -63,3 +63,59 @@ async fn rate_limit_recovery_preserves_settings_hold_and_clears_on_account_chang
+     assert_eq!(chat.queued_user_message_texts(), vec!["queued follow-up"]);
+     assert_no_submit_op(&mut ops);
+ }
++
++#[tokio::test]
++async fn usage_limit_recovery_resumes_once_after_auth_identity_change() {
++    let (mut chat, _events, mut ops) = make_chatwidget_manual(Some("test-model-a")).await;
++    set_chatgpt_auth(&mut chat);
++    chat.thread_id = Some(ThreadId::new());
++    let expected_resume_prompt = chat
++        .usage_limit_resume_prompt()
++        .expect("usage-limit recovery should be enabled");
++    handle_turn_started(&mut chat, "failed-turn");
++    chat.queue_user_message(UserMessage::from("queued follow-up"));
++    chat.on_rate_limit_error(RateLimitErrorKind::UsageLimit, "Usage exhausted".into());
++    assert_no_submit_op(&mut ops);
++
++    chat.update_account_state(
++        /*status_account_display*/ None, /*plan_type*/ None,
++        /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ true,
++    );
++    chat.handle_auth_identity_changed();
++    chat.on_auth_reload_completed(/*identity_changed*/ true);
++
++    let Op::UserTurn { items, .. } = next_submit_op(&mut ops) else {
++        panic!("expected the parked usage-limit continuation after auth changed");
++    };
++    assert!(
++        matches!(items.as_slice(), [UserInput::Text { text, .. }] if text == &expected_resume_prompt)
++    );
++    assert!(chat.pending_usage_limit_resume_turn.is_none());
++    assert!(!chat.usage_limit_resume_waiting_for_auth_reload);
++    assert_eq!(chat.queued_user_message_texts(), vec!["queued follow-up"]);
++
++    chat.on_auth_reload_completed(/*identity_changed*/ true);
++    assert_no_submit_op(&mut ops);
++    assert_eq!(chat.queued_user_message_texts(), vec!["queued follow-up"]);
++}
++
++#[tokio::test]
++async fn usage_limit_recovery_stays_parked_when_auth_identity_is_unchanged() {
++    let (mut chat, _events, mut ops) = make_chatwidget_manual(Some("test-model-a")).await;
++    set_chatgpt_auth(&mut chat);
++    chat.thread_id = Some(ThreadId::new());
++    handle_turn_started(&mut chat, "failed-turn");
++    chat.queue_user_message(UserMessage::from("queued follow-up"));
++    chat.on_rate_limit_error(RateLimitErrorKind::UsageLimit, "Usage exhausted".into());
++
++    chat.update_account_state(
++        /*status_account_display*/ None, /*plan_type*/ None,
++        /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ true,
++    );
++    chat.on_auth_reload_completed(/*identity_changed*/ false);
++
++    assert_no_submit_op(&mut ops);
++    assert!(chat.pending_usage_limit_resume_turn.is_some());
++    assert!(chat.usage_limit_resume_waiting_for_auth_reload);
++    assert_eq!(chat.queued_user_message_texts(), vec!["queued follow-up"]);
++}

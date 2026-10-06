@@ -190,6 +190,10 @@ pub fn keep_lease_across_exec(_file: &File) -> Result<()> {
 }
 
 pub fn codex_command(binary: &OsStr) -> Result<Command> {
+    Ok(Command::new(resolve_codex_binary(binary)?))
+}
+
+pub fn resolve_codex_binary(binary: &OsStr) -> Result<PathBuf> {
     let path = Path::new(binary);
     let directories: Vec<_> = if path.components().count() > 1 || path.is_absolute() {
         vec![std::path::PathBuf::new()]
@@ -210,13 +214,17 @@ pub fn codex_command(binary: &OsStr) -> Result<Command> {
         };
         for candidate in candidates {
             if candidate.is_file() {
-                return Ok(Command::new(candidate));
+                return Ok(candidate);
             }
         }
     }
     bail!(
         "could not find Codex on PATH; install the official Codex CLI or set XSWAP_CODEX_BIN to codex.exe or codex.cmd"
     )
+}
+
+pub fn pinned_binary_path(_file: &File, path: &Path) -> Result<OsString> {
+    Ok(path.as_os_str().to_owned())
 }
 
 /// CDXC:AgentProviders 2026-09-06 WHY:

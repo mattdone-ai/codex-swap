@@ -10,7 +10,7 @@ use std::{
     process::Command,
 };
 
-fn command(binary: &OsStr, home: &Path, file_auth: bool) -> Result<Command> {
+pub(crate) fn command(binary: &OsStr, home: &Path, file_auth: bool) -> Result<Command> {
     let mut cmd = crate::platform::codex_command(binary)?;
     cmd.env("CODEX_HOME", home);
     // Shell credentials must not silently outrank the explicitly selected account.
@@ -29,7 +29,7 @@ fn command(binary: &OsStr, home: &Path, file_auth: bool) -> Result<Command> {
     Ok(cmd)
 }
 
-fn check_overrides(args: &[OsString], shared: bool) -> Result<()> {
+pub(crate) fn check_overrides(args: &[OsString], shared: bool) -> Result<()> {
     for (i, arg) in args.iter().enumerate() {
         if arg == "--" {
             break;
@@ -40,7 +40,7 @@ fn check_overrides(args: &[OsString], shared: bool) -> Result<()> {
         } else {
             arg.strip_prefix("--config=")
                 .or_else(|| arg.strip_prefix("-c"))
-                .map(std::borrow::Cow::Borrowed)
+                .map(|value| std::borrow::Cow::Borrowed(value.strip_prefix('=').unwrap_or(value)))
         };
         if let Some(value) = value {
             let key = value

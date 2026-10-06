@@ -15,6 +15,22 @@ fn value(store: &Store, key: &str) -> Result<Value> {
                 .as_deref()
                 .unwrap_or("codex")
         )),
+        "seamless-codext-sha256" => Ok(json!(
+            store
+                .data
+                .preferences
+                .seamless_codext_sha256
+                .as_deref()
+                .unwrap_or("")
+        )),
+        "seamless-codext-bin" => Ok(json!(
+            store
+                .data
+                .preferences
+                .seamless_codext_bin
+                .as_deref()
+                .unwrap_or("")
+        )),
         "default-account" => Ok(store
             .data
             .default
@@ -46,7 +62,7 @@ fn value(store: &Store, key: &str) -> Result<Value> {
                 .join(",")
         )),
         _ => bail!(
-            "unknown preference {key:?}; supported keys: codex-bin, default-account, autoswitch.five-hour-threshold, autoswitch.seven-day-threshold, autoswitch.interval-seconds, autoswitch.cooldown-seconds, autoswitch.hysteresis-percent, autoswitch.unhealthy-ticks, autoswitch.supplementary-scopes"
+            "unknown preference {key:?}; supported keys: codex-bin, seamless-codext-bin, seamless-codext-sha256, default-account, autoswitch.five-hour-threshold, autoswitch.seven-day-threshold, autoswitch.interval-seconds, autoswitch.cooldown-seconds, autoswitch.hysteresis-percent, autoswitch.unhealthy-ticks, autoswitch.supplementary-scopes"
         ),
     }
 }
@@ -86,6 +102,8 @@ pub fn configure(cli: &Cli, action: Option<&ConfigAction>, output: &Output) -> R
         ConfigAction::List => emit(
             json!({
                 "codex-bin": value(&store, "codex-bin")?,
+                "seamless-codext-bin": value(&store, "seamless-codext-bin")?,
+                "seamless-codext-sha256": value(&store, "seamless-codext-sha256")?,
                 "default-account": value(&store, "default-account")?,
                 "autoswitch.five-hour-threshold": value(&store, "autoswitch.five-hour-threshold")?,
                 "autoswitch.seven-day-threshold": value(&store, "autoswitch.seven-day-threshold")?,
@@ -115,6 +133,24 @@ pub fn configure(cli: &Cli, action: Option<&ConfigAction>, output: &Output) -> R
                     };
                     store.data.preferences.codex_bin = Some(binary);
                     store.save()?;
+                }
+                "seamless-codext-sha256" => {
+                    let digest = new.trim().to_ascii_lowercase();
+                    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        bail!("seamless-codext-sha256 must be exactly 64 hexadecimal characters");
+                    }
+                    store.data.preferences.seamless_codext_sha256 = Some(digest);
+                }
+                "seamless-codext-bin" => {
+                    let path = std::path::Path::new(new);
+                    if !path.is_absolute() || new.contains('\0') {
+                        bail!("seamless-codext-bin must be an absolute executable path");
+                    }
+                    store.data.preferences.seamless_codext_bin = Some(
+                        crate::fsutil::absolute(path)?
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
                 }
                 "default-account" => {
                     drop(store);
@@ -167,6 +203,8 @@ pub fn configure(cli: &Cli, action: Option<&ConfigAction>, output: &Output) -> R
         ConfigAction::Unset { key } => {
             match key.as_str() {
                 "codex-bin" => store.data.preferences.codex_bin = None,
+                "seamless-codext-bin" => store.data.preferences.seamless_codext_bin = None,
+                "seamless-codext-sha256" => store.data.preferences.seamless_codext_sha256 = None,
                 "default-account" => {
                     drop(store);
                     crate::commands::select_global(cli, Some("default"))?;

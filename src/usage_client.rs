@@ -69,6 +69,14 @@ pub fn fetch(
     expected: &Option<auth::Identity>,
 ) -> Result<(auth::Identity, Response)> {
     let (auth, identity) = auth::verified_credentials(home, expected)?;
+    fetch_credentials(client, &auth, identity)
+}
+
+pub(crate) fn fetch_credentials(
+    client: &Client,
+    auth: &Value,
+    identity: auth::Identity,
+) -> Result<(auth::Identity, Response)> {
     let token = auth["tokens"]["access_token"]
         .as_str()
         .filter(|value| !value.is_empty())

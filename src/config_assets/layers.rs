@@ -12,6 +12,7 @@ pub(super) struct Invocation<'a> {
     pub profile: Option<&'a str>,
     pub overrides: toml::Value,
     pub loads_user_config: bool,
+    pub command: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +159,7 @@ pub(super) fn invocation<'a>(args: &'a [OsString], current: &Path) -> Invocation
         profile,
         overrides,
         loads_user_config,
+        command,
     }
 }
 

@@ -12,6 +12,7 @@ mod maintenance;
 mod mappings;
 mod platform;
 mod preferences;
+mod seamless;
 mod sharing;
 mod store;
 mod upgrade;
@@ -35,6 +36,7 @@ fn execute(cli: &Cli) -> anyhow::Result<()> {
             output,
         } => usage::show(cli, account.as_deref(), *all, output),
         Action::Auto(args) => autoswitch::run(cli, args),
+        Action::Session { account, args } => seamless::run(cli, account.as_deref(), args),
         Action::Rename {
             account,
             alias,

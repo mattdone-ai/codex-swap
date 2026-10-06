@@ -60,6 +60,31 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
     }
     let mut homes = BTreeSet::from([store.data.main_home.clone()]);
     let mut managed_homes = Vec::new();
+    let runtime_home = crate::seamless::home(&store);
+    let managed_runtime = match fs::symlink_metadata(&runtime_home) {
+        Ok(_) => {
+            real_directory(&runtime_home)?;
+            if runtime_home.canonicalize()? != runtime_home {
+                bail!("purge refused: seamless runtime path is not canonical");
+            }
+            crate::seamless::validate_runtime(&runtime_home)?;
+            for protected_home in &protected {
+                let protected_home = fsutil::absolute(protected_home)?;
+                if runtime_home.starts_with(&protected_home)
+                    || protected_home.starts_with(&runtime_home)
+                {
+                    bail!(
+                        "purge refused: seamless runtime overlaps an original or adopted Codex home ({})",
+                        protected_home.display()
+                    );
+                }
+            }
+            homes.insert(runtime_home.clone());
+            Some(runtime_home)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     for account in &store.data.accounts {
         homes.insert(account.home.clone());
         if account.managed && account.home.parent() != Some(profiles.as_path()) {
@@ -96,8 +121,9 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
             );
         }
         eprintln!(
-            "Delete the xswap registry, {} managed account home(s) and {} login staging home(s) under {}? Original/adopted homes and shared data will remain.",
+            "Delete the xswap registry, {} managed account home(s), {} seamless runtime(s) and {} login staging home(s) under {}? Original/adopted homes and shared data will remain.",
             managed_homes.len(),
+            usize::from(managed_runtime.is_some()),
             staging.len(),
             store.root.display()
         );
@@ -118,6 +144,10 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
         fs::remove_dir_all(home)
             .with_context(|| format!("remove managed home {}", home.display()))?;
     }
+    if let Some(runtime) = &managed_runtime {
+        fs::remove_dir_all(runtime)
+            .with_context(|| format!("remove managed runtime {}", runtime.display()))?;
+    }
     if profiles.exists() {
         fs::remove_dir(&profiles)?;
     }
@@ -129,13 +159,14 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
     if output.json {
         serde_json::to_writer_pretty(
             std::io::stdout().lock(),
-            &json!({"schemaVersion": 1, "purged": true, "managedHomesRemoved": managed_homes.len(), "loginStagingHomesRemoved": staging_removed, "retainedHomes": protected, "retainedLockDirectory": store.root}),
+            &json!({"schemaVersion": 1, "purged": true, "managedHomesRemoved": managed_homes.len(), "managedRuntimeHomesRemoved": usize::from(managed_runtime.is_some()), "loginStagingHomesRemoved": staging_removed, "retainedHomes": protected, "retainedLockDirectory": store.root}),
         )?;
         println!();
     } else {
         println!(
-            "Purged xswap registry, {} managed account home(s) and {} login staging home(s). Original/adopted homes and lock files retained.",
+            "Purged xswap registry, {} managed account home(s), {} seamless runtime(s) and {} login staging home(s). Original/adopted homes and lock files retained.",
             managed_homes.len(),
+            usize::from(managed_runtime.is_some()),
             staging_removed
         );
     }

@@ -211,12 +211,34 @@ pub fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     write_json(path, value, false)
 }
 
+pub fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if fs::symlink_metadata(path).is_ok() {
+        regular(path)?;
+    }
+    write_private(path, false, |temp| {
+        temp.write_all(bytes)?;
+        Ok(())
+    })
+}
+
 /// Creates a private JSON file without replacing an existing backup.
 pub fn create_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     write_json(path, value, true)
 }
 
 fn write_json(path: &Path, value: &impl serde::Serialize, no_clobber: bool) -> Result<()> {
+    write_private(path, no_clobber, |temp| {
+        serde_json::to_writer_pretty(&mut *temp, value)?;
+        temp.write_all(b"\n")?;
+        Ok(())
+    })
+}
+
+fn write_private(
+    path: &Path,
+    no_clobber: bool,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -230,8 +252,7 @@ fn write_json(path: &Path, value: &impl serde::Serialize, no_clobber: bool) -> R
         crate::platform::own_new(temp.path())?;
         crate::platform::private_permissions(temp.path(), false)?;
     }
-    serde_json::to_writer_pretty(&mut temp, value)?;
-    temp.write_all(b"\n")?;
+    write(temp.as_file_mut())?;
     temp.as_file().sync_all()?;
     #[cfg(test)]
     test_faults::check(path, test_faults::Point::BeforeCommit)?;

@@ -108,10 +108,25 @@ pub fn status(cli: &Cli, output: &Output) -> Result<()> {
     let active = selected
         .as_ref()
         .map(|a| view(&store, a, selected.as_ref()));
+    let (seamless_active, seamless_error) = match crate::seamless::status_account(&store) {
+        Ok(Some((account, home))) => (
+            Some(json!({
+                "number": account.number,
+                "alias": account.alias,
+                "email": account.identity.as_ref().and_then(|identity| identity.email.clone()),
+                "accountId": account.identity.as_ref().map(|identity| &identity.account_id),
+                "home": home,
+            })),
+            None,
+        ),
+        Ok(None) => (None, None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
     if output.json {
         emit(
             &json!({"schemaVersion": 1, "active": active, "defaultHome": store.data.main_home,
-            "usesOriginalDefault": selected.as_ref().is_some_and(|active| store.main_account().is_some_and(|original| original.number == active.number)), "launchDefault": store.data.default}),
+            "usesOriginalDefault": selected.as_ref().is_some_and(|active| store.main_account().is_some_and(|original| original.number == active.number)), "launchDefault": store.data.default,
+            "seamlessActive": seamless_active.as_ref(), "seamlessError": seamless_error.as_ref()}),
         )?;
     } else if let Some(active) = active {
         human(&active);
@@ -126,6 +141,21 @@ pub fn status(cli: &Cli, output: &Output) -> Result<()> {
         );
     } else {
         println!("No current Codex login. Sign in with Codex, then use xswap add.");
+    }
+    if !output.json {
+        if let Some(active) = seamless_active {
+            let number = active["number"].as_u64().unwrap_or_default();
+            let label = active["alias"]
+                .as_str()
+                .or_else(|| active["email"].as_str())
+                .unwrap_or("saved account");
+            println!(
+                "Seamless runtime: account {number} ({})",
+                label.escape_default()
+            );
+        } else if let Some(error) = seamless_error {
+            println!("Seamless runtime error: {}", error.escape_default());
+        }
     }
     Ok(())
 }

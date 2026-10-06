@@ -66,6 +66,12 @@ pub enum Action {
     },
     /// Poll account quotas and switch when configured limits are reached.
     Auto(Auto),
+    /// Launch a pinned Codext session whose account can rotate between turns.
+    Session {
+        account: Option<String>,
+        #[arg(last = true)]
+        args: Vec<OsString>,
+    },
     /// Set or clear an account alias.
     #[command(visible_alias = "alias")]
     Rename {
@@ -233,6 +239,9 @@ pub struct Auto {
     /// Emit one JSON object per line.
     #[arg(long)]
     pub json: bool,
+    /// Rotate only the isolated xswap Codext runtime instead of the global Codex login.
+    #[arg(long)]
+    pub seamless: bool,
 }
 
 #[derive(Args)]

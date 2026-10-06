@@ -38,6 +38,10 @@ pub fn require_registered_identity(number: u32, identity: &Option<Identity>) -> 
 pub struct Preferences {
     pub codex_bin: Option<String>,
     #[serde(default)]
+    pub seamless_codext_bin: Option<String>,
+    #[serde(default)]
+    pub seamless_codext_sha256: Option<String>,
+    #[serde(default)]
     pub autoswitch: AutoswitchPreferences,
 }
 
@@ -231,6 +235,14 @@ impl Store {
             .is_some_and(|bin| bin.trim().is_empty() || bin.contains('\0'))
         {
             bail!("invalid configured Codex executable");
+        }
+        if data
+            .preferences
+            .seamless_codext_bin
+            .as_ref()
+            .is_some_and(|bin| bin.trim().is_empty() || bin.contains('\0'))
+        {
+            bail!("invalid configured seamless Codext executable");
         }
         data.preferences.autoswitch.validate()?;
         for account in &mut data.accounts {

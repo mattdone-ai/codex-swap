@@ -341,6 +341,10 @@ pub fn share(source_home: &Path, home: &Path, args: &[OsString]) -> Result<()> {
     share_at(source_home, home, args, &std::env::current_dir()?)
 }
 
+pub(crate) fn subcommand(args: &[OsString]) -> Option<&str> {
+    layers::invocation(args, Path::new(".")).command
+}
+
 fn share_at(source_home: &Path, home: &Path, args: &[OsString], cwd: &Path) -> Result<()> {
     let invocation = layers::invocation(args, cwd);
     if !invocation.loads_user_config {

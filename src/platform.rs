@@ -28,6 +28,26 @@ pub fn codex_command(binary: &std::ffi::OsStr) -> anyhow::Result<std::process::C
 }
 
 #[cfg(unix)]
+pub fn resolve_codex_binary(binary: &std::ffi::OsStr) -> anyhow::Result<std::path::PathBuf> {
+    std::fs::canonicalize(std::path::Path::new(binary)).map_err(Into::into)
+}
+
+#[cfg(unix)]
+pub fn pinned_binary_path(file: &std::fs::File) -> anyhow::Result<std::ffi::OsString> {
+    use anyhow::bail;
+    use std::os::fd::AsRawFd;
+    keep_lease_across_exec(file)?;
+    #[cfg(target_os = "linux")]
+    let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    #[cfg(not(target_os = "linux"))]
+    let path = std::path::PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
+    if !path.exists() {
+        bail!("this platform cannot execute the verified Codext file descriptor");
+    }
+    Ok(path.into_os_string())
+}
+
+#[cfg(unix)]
 pub fn execute(mut cmd: std::process::Command, _lease: std::fs::File) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::os::unix::process::CommandExt;

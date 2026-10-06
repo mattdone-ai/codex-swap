@@ -10,6 +10,7 @@ use crate::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -25,6 +26,7 @@ struct Target {
     number: u32,
     home: PathBuf,
     identity: auth::Identity,
+    credentials: Option<Value>,
 }
 
 struct Snapshot {
@@ -181,6 +183,7 @@ fn record_switch(state: &mut State, dry_run: bool, now: i64, from: u32, to: u32)
 fn target_descriptors(
     store: &Store,
     active: &crate::store::Account,
+    runtime: Option<&crate::seamless::RuntimeAuth>,
 ) -> (Vec<Target>, BTreeMap<u32, String>) {
     let mut targets = Vec::new();
     let mut errors = BTreeMap::new();
@@ -192,24 +195,42 @@ fn target_descriptors(
                 continue;
             }
         };
-        let effective = store.effective_account(account, Some(active));
+        let (home, credentials) = match runtime {
+            Some(runtime) if account.number == active.number => {
+                (runtime.home.clone(), Some(runtime.document.clone()))
+            }
+            Some(_) => (account.home.clone(), None),
+            None => (store.effective_account(account, Some(active)).home, None),
+        };
         targets.push(Target {
             number: account.number,
-            home: effective.home,
+            home,
             identity,
+            credentials,
         });
     }
     (targets, errors)
 }
 
-fn snapshot(cli: &Cli) -> Result<Snapshot> {
+fn snapshot(cli: &Cli, seamless: bool) -> Result<Snapshot> {
     let store = Store::open_with_stop_policy(cli, crate::cli::StopCodex::Never)?;
-    let source = auth::identity(&store.data.main_home)?
-        .context("no active Codex login; register and activate an account before autoswitch")?;
-    let active = store
-        .account_for_identity(&source)?
-        .context("the active Codex login is not registered; import or add it before autoswitch")?;
-    let (targets, setup_errors) = target_descriptors(&store, &active);
+    let runtime = seamless
+        .then(|| crate::seamless::snapshot(&store))
+        .transpose()?;
+    let (source, active) = if let Some(runtime) = &runtime {
+        (
+            require_registered_identity(runtime.account.number, &runtime.account.identity)?.clone(),
+            runtime.account.clone(),
+        )
+    } else {
+        let source = auth::identity(&store.data.main_home)?
+            .context("no active Codex login; register and activate an account before autoswitch")?;
+        let active = store.account_for_identity(&source)?.context(
+            "the active Codex login is not registered; import or add it before autoswitch",
+        )?;
+        (source, active)
+    };
+    let (targets, setup_errors) = target_descriptors(&store, &active, runtime.as_ref());
     let mut homes = BTreeSet::new();
     homes.extend(targets.iter().map(|target| target.home.clone()));
     let leases = homes
@@ -231,7 +252,13 @@ fn collect(snapshot: &Snapshot) -> Result<(Vec<Sample>, Option<i64>)> {
     let mut samples = Vec::new();
     let mut backoff_until = None;
     for target in &snapshot.targets {
-        match usage_client::fetch(&client, &target.home, &Some(target.identity.clone())) {
+        let result = match &target.credentials {
+            Some(document) => {
+                usage_client::fetch_credentials(&client, document, target.identity.clone())
+            }
+            None => usage_client::fetch(&client, &target.home, &Some(target.identity.clone())),
+        };
+        match result {
             Ok((identity, response)) => {
                 let fetched_at = Utc::now();
                 match usage_model::parse(&response, fetched_at) {
@@ -412,7 +439,7 @@ fn tick(cli: &Cli, args: &Auto, state_path: &Path) -> Result<u64> {
         return Ok((until - now) as u64);
     }
 
-    let snapshot = snapshot(cli)?;
+    let snapshot = snapshot(cli, args.seamless)?;
     if saved.active != Some(snapshot.active) {
         saved.active = Some(snapshot.active);
         saved.unhealthy_ticks = 0;
@@ -517,7 +544,12 @@ fn tick(cli: &Cli, args: &Auto, state_path: &Path) -> Result<u64> {
     event.trigger = Some(trigger);
     event.dry_run = args.dry_run;
     if !args.dry_run {
-        if let Err(error) = account_state::select_global_guarded(cli, &guard) {
+        let activation = if args.seamless {
+            crate::seamless::activate_guarded(cli, &guard)
+        } else {
+            account_state::select_global_guarded(cli, &guard)
+        };
+        if let Err(error) = activation {
             event.event = "no-switch";
             event.reason = Some(if format!("{error:#}").contains("Codex is running") {
                 "blocked-running-codex"
@@ -548,7 +580,11 @@ pub fn run(cli: &Cli, args: &Auto) -> Result<()> {
     drop(initial);
     let _singleton = fsutil::lock(&root.join(LOCK_FILE), true, false)
         .context("another xswap auto process is already running")?;
-    let state_path = root.join(STATE_FILE);
+    let state_path = root.join(if args.seamless {
+        "autoswitch-state-seamless.json"
+    } else {
+        STATE_FILE
+    });
     loop {
         let delay = match tick(cli, args, &state_path) {
             Ok(delay) => delay,
@@ -844,9 +880,54 @@ mod tests {
             enabled: true,
         };
         store.data.accounts = vec![ready.clone(), incomplete];
-        let (targets, errors) = target_descriptors(&store, &ready);
+        let (targets, errors) = target_descriptors(&store, &ready, None);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].number, 1);
         assert!(errors.get(&2).unwrap().contains("setup is incomplete"));
+    }
+
+    #[test]
+    fn seamless_targets_read_the_active_runtime_and_inactive_saved_homes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(directory.path().join("data")),
+            codex_home: Some(directory.path().join("main")),
+            codex_bin: None,
+            stop_codex: false,
+            command: crate::cli::Action::List(crate::cli::Output { json: false }),
+        };
+        let mut store = Store::open(&cli).unwrap();
+        let active = Account {
+            number: 1,
+            alias: Some("active".into()),
+            home: directory.path().join("saved-active"),
+            managed: true,
+            share_history: true,
+            identity: Some(identity(1)),
+            enabled: true,
+        };
+        let inactive = Account {
+            number: 2,
+            alias: Some("inactive".into()),
+            home: directory.path().join("saved-inactive"),
+            managed: true,
+            share_history: true,
+            identity: Some(identity(2)),
+            enabled: true,
+        };
+        store.data.accounts = vec![active.clone(), inactive.clone()];
+        let runtime = crate::seamless::RuntimeAuth {
+            account: active.clone(),
+            document: serde_json::json!({"private": "not emitted"}),
+            home: directory.path().join("runtime"),
+        };
+
+        let (targets, errors) = target_descriptors(&store, &active, Some(&runtime));
+
+        assert!(errors.is_empty());
+        assert_eq!(targets[0].home, runtime.home);
+        assert!(targets[0].credentials.is_some());
+        assert_eq!(targets[1].home, inactive.home);
+        assert!(targets[1].credentials.is_none());
     }
 }
