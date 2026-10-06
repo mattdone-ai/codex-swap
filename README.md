@@ -81,19 +81,38 @@ Verify the downloaded archive against its entry in `SHA256SUMS` using `shasum -a
 Developers building from source need Rust 1.85 or newer:
 
 ```sh
-cargo install --git https://github.com/maddada/codex-swap --locked
+cargo install --git https://github.com/mattdone-ai/codex-swap \
+  --branch feature/autoswitch --locked --root ~/.local
 xswap --version
 ```
 
 From a checkout:
 
 ```sh
-cargo install --path . --locked
+cargo install --path . --locked --root ~/.local
 ```
 
-Cargo installs the `xswap` executable into `~/.cargo/bin`. To use `~/.local/bin` instead, add `--root ~/.local` to the install command.
+Until the autoswitch branch is merged into the fork's default branch, install it
+with the explicit `--branch feature/autoswitch` command above or from a checkout
+of that branch. Do not use `xswap upgrade` for this branch-only build: Cargo
+upgrades fetch the fork's default branch. From a checkout, update the branch and
+repeat `cargo install --path . --locked --force --root ~/.local` instead.
 
-On macOS and Linux, `xswap upgrade` first recognises install-script installations by their receipt, then detects Cargo installations and runs `cargo install --git https://github.com/maddada/codex-swap --locked --force --root <original-root>`, including for installations originally built with `--path`. Detection follows executable symlinks and preserves custom install roots. Homebrew installations use Homebrew without requiring Cargo. An unrecognized Unix installation prints manual upgrade instructions and exits with status 1; a missing package manager also exits with status 1. Package-manager output and exit status are preserved, and upgrading does not initialize accounts or launch Codex.
+Run the same native Rust gates used before commits with:
+
+```sh
+make precommit
+```
+
+The target checks that every file under `src/` and `tests/` is tracked, then
+runs formatting, the full test suite, Clippy with warnings denied, and a release
+build.
+
+The commands above install `xswap` into `~/.local/bin`. Omit `--root ~/.local`
+to use Cargo's default `~/.cargo/bin` directory instead; the service template
+supports both locations.
+
+On macOS and Linux, `xswap upgrade` first recognises install-script installations by their receipt, then detects Cargo installations and runs `cargo install --git https://github.com/mattdone-ai/codex-swap --locked --force --root <original-root>`, including for installations originally built with `--path`. This installs the fork's default branch; use the checkout command above while autoswitch remains branch-only. Detection follows executable symlinks and preserves custom install roots. Homebrew installations use Homebrew without requiring Cargo. An unrecognized Unix installation prints manual upgrade instructions and exits with status 1; a missing package manager also exits with status 1. Package-manager output and exit status are preserved, and upgrading does not initialize accounts or launch Codex.
 
 ## Set up accounts
 
@@ -232,6 +251,46 @@ Malformed optional model limits are skipped while healthy core and supplementary
 Pacing estimates end-of-window usage from the amount used and time elapsed. `ahead` means at least 10% projected quota remains; `on_track` means less than 10% remains; `behind` means the quota is projected to run out before reset. An exhaustion estimate appears only when it precedes reset. Pacing is unavailable for zero usage, a missing/expired reset window, or until at least 60 seconds and 1% of the window have elapsed. It is an estimate of a changing usage rate.
 
 The API request and pacing follow [OpenUsage](https://github.com/robinebers/openusage). xswap reads the account’s current Codex access token and account ID to request `https://chatgpt.com/backend-api/wham/usage`. Codex still owns token refresh. If a token is expired, run Codex for that account to refresh it or use `xswap login ACCOUNT`. `list` and `status` remain local and make no usage requests. `--all` includes disabled accounts and reports account failures individually; it exits unsuccessfully if any report fails while preserving successful reports in the output.
+
+## Automatic quota switching
+
+After registering at least two accounts, run one evaluation or a foreground
+polling loop:
+
+```sh
+xswap auto --once --dry-run
+xswap auto --json
+```
+
+The default policy checks every 60 seconds. It triggers independently at 94%
+of a reported 5-hour Codex window or 98% of a reported 7-day Codex window,
+including a weekly window reported in the provider's primary slot. It waits 300
+seconds after a successful switch and moves proactively to any safe account with
+strictly better positive runway. After three consecutive unreadable samples it
+fails over only to an account with the configured 10-point safety margin. At a
+hard 100% limit it may land on the best account with any measured headroom.
+Unknown, stale, malformed, or failed usage is never treated as healthy.
+
+Core Codex windows bind by default. Add comma-separated supplementary provider
+scope names explicitly; unrelated `code_review` limits do not bind unless named:
+
+```sh
+xswap config set autoswitch.supplementary-scopes model_name
+xswap config set autoswitch.five-hour-threshold 94
+xswap config set autoswitch.seven-day-threshold 98
+xswap config list
+```
+
+`xswap auto` never stops Codex. Stock Codex caches authentication, so when a
+switch is due while any Codex session is running the daemon emits
+`blocked-running-codex` and retries later. Exit all stock Codex sessions before
+the global account changes, then restart them. `--dry-run` never writes active
+credentials. JSON mode emits one object per line for service logs.
+
+A user-service template is provided at `contrib/xswap-auto.service`. Copy it to
+`~/.config/systemd/user/`, then use `systemctl --user daemon-reload` and
+`systemctl --user enable --now xswap-auto.service` only after accounts and a
+dry run have been verified.
 
 ## Manage accounts
 

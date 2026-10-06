@@ -111,6 +111,13 @@ pub fn credentials(home: &Path) -> Result<(Value, Identity)> {
         .context("no file-based ChatGPT login here; sign in with Codex first")
 }
 
+pub(crate) fn credentials_from_bytes(bytes: &[u8]) -> Result<(Value, Identity)> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::anyhow!("invalid Codex auth.json (contents omitted)"))?;
+    let identity = identity_value(&value)?;
+    Ok((value, identity))
+}
+
 fn identity_value(value: &Value) -> Result<Identity> {
     let mode = Option::<AuthMode>::deserialize(&value["auth_mode"])
         .map_err(|_| anyhow::anyhow!("invalid Codex auth_mode (contents omitted)"))?;

@@ -1,5 +1,6 @@
 mod account_state;
 mod auth;
+mod autoswitch;
 mod backup;
 mod cli;
 mod commands;
@@ -33,6 +34,7 @@ fn execute(cli: &Cli) -> anyhow::Result<()> {
             all,
             output,
         } => usage::show(cli, account.as_deref(), *all, output),
+        Action::Auto(args) => autoswitch::run(cli, args),
         Action::Rename {
             account,
             alias,

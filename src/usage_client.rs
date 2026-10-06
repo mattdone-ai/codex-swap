@@ -6,6 +6,44 @@ use std::{io::Read, path::Path, time::Duration};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAX_RETRY_AFTER_SECONDS: u64 = 3600;
+
+#[derive(Debug)]
+pub struct RateLimited {
+    pub retry_after_seconds: u64,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex usage API is rate limited (HTTP 429); retry after {} seconds",
+            self.retry_after_seconds
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+fn retry_after_seconds_at(headers: &HeaderMap, now: chrono::DateTime<chrono::Utc>) -> u64 {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            value
+                .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok())
+                .map(|retry| retry.timestamp().saturating_sub(now.timestamp()).max(1) as u64)
+        })
+        .unwrap_or(60)
+        .clamp(1, MAX_RETRY_AFTER_SECONDS)
+}
+
+fn retry_after_seconds(headers: &HeaderMap) -> u64 {
+    retry_after_seconds_at(headers, chrono::Utc::now())
+}
 
 pub struct Response {
     pub body: Value,
@@ -55,7 +93,10 @@ pub fn fetch(
         );
     }
     if status.as_u16() == 429 {
-        bail!("Codex usage API is rate limited (HTTP 429); retry later");
+        return Err(RateLimited {
+            retry_after_seconds: retry_after_seconds(response.headers()),
+        }
+        .into());
     }
     if !status.is_success() {
         bail!("Codex usage request failed (HTTP {})", status.as_u16());
@@ -75,4 +116,31 @@ pub fn fetch(
         bail!("Codex usage API returned an invalid response");
     }
     Ok((identity, Response { body, headers }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_is_bounded_and_defaults() {
+        let mut headers = HeaderMap::new();
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        assert_eq!(retry_after_seconds_at(&headers, now), 60);
+        headers.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+        assert_eq!(retry_after_seconds_at(&headers, now), 1);
+        headers.insert(reqwest::header::RETRY_AFTER, "99999".parse().unwrap());
+        assert_eq!(retry_after_seconds_at(&headers, now), 3600);
+        headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
+        assert_eq!(retry_after_seconds_at(&headers, now), 120);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            chrono::DateTime::from_timestamp(1_800_000_120, 0)
+                .unwrap()
+                .to_rfc2822()
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(retry_after_seconds_at(&headers, now), 120);
+    }
 }

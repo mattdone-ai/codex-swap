@@ -4,7 +4,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     pub plan: Option<String>,
@@ -16,7 +16,7 @@ pub struct Usage {
     pub warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Credits {
     pub balance: Option<f64>,
@@ -24,7 +24,7 @@ pub struct Credits {
     pub unlimited: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Window {
     pub scope: String,
@@ -38,7 +38,7 @@ pub struct Window {
     pub pacing: Option<Pacing>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pacing {
     pub status: &'static str,
@@ -420,8 +420,7 @@ mod additional_limit_regressions {
             json!([{ "rate_limit": {"primary_window": null} }]),
         ] {
             let error = parse_body(json!({"additional_rate_limits": optional}))
-                .err()
-                .expect("no usable windows or account data must fail");
+                .expect_err("no usable windows or account data must fail");
             assert!(error.to_string().contains("no recognized usage data"));
         }
     }
@@ -640,9 +639,7 @@ mod credit_header_regressions {
                 json!({"credits": {}}),
                 json!({"credits": {"balance": "NaN", "has_credits": "false", "unlimited": 1}}),
             ] {
-                let error = parse(&response(body, header), now())
-                    .err()
-                    .expect("no recognized data");
+                let error = parse(&response(body, header), now()).expect_err("no recognized data");
                 assert_eq!(
                     error.to_string(),
                     "Codex usage API returned no recognized usage data"

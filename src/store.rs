@@ -33,10 +33,93 @@ pub fn require_registered_identity(number: u32, identity: &Option<Identity>) -> 
         .with_context(|| format!("account {number} setup is incomplete; use xswap login {number} for new setup, or xswap add --login --email <owner> --slot <unused-slot> for an unresolved legacy owner"))
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Preferences {
     pub codex_bin: Option<String>,
+    #[serde(default)]
+    pub autoswitch: AutoswitchPreferences,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutoswitchPreferences {
+    #[serde(default = "default_five_hour_threshold")]
+    pub five_hour_threshold: f64,
+    #[serde(default = "default_seven_day_threshold")]
+    pub seven_day_threshold: f64,
+    #[serde(default = "default_interval_seconds")]
+    pub interval_seconds: u64,
+    #[serde(default = "default_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+    #[serde(default = "default_hysteresis_percent")]
+    pub hysteresis_percent: f64,
+    #[serde(default = "default_unhealthy_ticks")]
+    pub unhealthy_ticks: u32,
+    #[serde(default)]
+    pub supplementary_scopes: Vec<String>,
+}
+
+impl Default for AutoswitchPreferences {
+    fn default() -> Self {
+        Self {
+            five_hour_threshold: default_five_hour_threshold(),
+            seven_day_threshold: default_seven_day_threshold(),
+            interval_seconds: default_interval_seconds(),
+            cooldown_seconds: default_cooldown_seconds(),
+            hysteresis_percent: default_hysteresis_percent(),
+            unhealthy_ticks: default_unhealthy_ticks(),
+            supplementary_scopes: Vec::new(),
+        }
+    }
+}
+
+fn default_five_hour_threshold() -> f64 {
+    94.0
+}
+fn default_seven_day_threshold() -> f64 {
+    98.0
+}
+fn default_interval_seconds() -> u64 {
+    60
+}
+fn default_cooldown_seconds() -> u64 {
+    300
+}
+fn default_hysteresis_percent() -> f64 {
+    10.0
+}
+fn default_unhealthy_ticks() -> u32 {
+    3
+}
+
+impl AutoswitchPreferences {
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("five-hour threshold", self.five_hour_threshold),
+            ("seven-day threshold", self.seven_day_threshold),
+        ] {
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) || value == 0.0 {
+                bail!("autoswitch {name} must be finite and greater than 0 through 100");
+            }
+        }
+        if self.interval_seconds == 0 || self.cooldown_seconds == 0 || self.unhealthy_ticks == 0 {
+            bail!("autoswitch interval, cooldown and unhealthy-ticks must be positive");
+        }
+        if !self.hysteresis_percent.is_finite() || !(0.0..100.0).contains(&self.hysteresis_percent)
+        {
+            bail!("autoswitch hysteresis must be finite and at least 0 but less than 100");
+        }
+        if self.supplementary_scopes.iter().any(|scope| {
+            scope.trim().is_empty()
+                || scope
+                    .bytes()
+                    .any(|byte| matches!(byte, b'\n' | b'\r' | b'\0'))
+        }) {
+            bail!("autoswitch supplementary scopes must be non-empty single-line names");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -70,6 +153,10 @@ pub struct Store {
 
 impl Store {
     pub fn open(cli: &Cli) -> Result<Self> {
+        Self::open_with_stop_policy(cli, cli.stop_policy())
+    }
+
+    pub(crate) fn open_with_stop_policy(cli: &Cli, stop_codex: StopCodex) -> Result<Self> {
         let user_home = fsutil::user_home()?;
         let root = match &cli.data_dir {
             Some(root) => root.clone(),
@@ -145,6 +232,7 @@ impl Store {
         {
             bail!("invalid configured Codex executable");
         }
+        data.preferences.autoswitch.validate()?;
         for account in &mut data.accounts {
             if account.home != data.main_home {
                 crate::auth::enrich_legacy_identity(&account.home, &mut account.identity);
@@ -159,7 +247,7 @@ impl Store {
             root,
             data,
             _lock: lock,
-            stop_codex: cli.stop_policy(),
+            stop_codex,
             configured_codex,
         })
     }

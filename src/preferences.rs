@@ -1,8 +1,8 @@
 use crate::{
     cli::{Cli, ConfigAction, Output},
-    store::Store,
+    store::{AutoswitchPreferences, Store},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 fn value(store: &Store, key: &str) -> Result<Value> {
@@ -19,7 +19,35 @@ fn value(store: &Store, key: &str) -> Result<Value> {
             .data
             .default
             .map_or_else(|| json!("default"), |n| json!(n.to_string()))),
-        _ => bail!("unknown preference {key:?}; supported keys: codex-bin, default-account"),
+        "autoswitch.five-hour-threshold" => {
+            Ok(json!(store.data.preferences.autoswitch.five_hour_threshold))
+        }
+        "autoswitch.seven-day-threshold" => {
+            Ok(json!(store.data.preferences.autoswitch.seven_day_threshold))
+        }
+        "autoswitch.interval-seconds" => {
+            Ok(json!(store.data.preferences.autoswitch.interval_seconds))
+        }
+        "autoswitch.cooldown-seconds" => {
+            Ok(json!(store.data.preferences.autoswitch.cooldown_seconds))
+        }
+        "autoswitch.hysteresis-percent" => {
+            Ok(json!(store.data.preferences.autoswitch.hysteresis_percent))
+        }
+        "autoswitch.unhealthy-ticks" => {
+            Ok(json!(store.data.preferences.autoswitch.unhealthy_ticks))
+        }
+        "autoswitch.supplementary-scopes" => Ok(json!(
+            store
+                .data
+                .preferences
+                .autoswitch
+                .supplementary_scopes
+                .join(",")
+        )),
+        _ => bail!(
+            "unknown preference {key:?}; supported keys: codex-bin, default-account, autoswitch.five-hour-threshold, autoswitch.seven-day-threshold, autoswitch.interval-seconds, autoswitch.cooldown-seconds, autoswitch.hysteresis-percent, autoswitch.unhealthy-ticks, autoswitch.supplementary-scopes"
+        ),
     }
 }
 
@@ -34,11 +62,20 @@ fn emit(value: Value, output: &Output) -> Result<()> {
         for (key, value) in object {
             println!(
                 "{key} = {}",
-                value.as_str().unwrap_or_default().escape_default()
+                value.as_str().map_or_else(
+                    || value.to_string(),
+                    |value| value.escape_default().to_string()
+                )
             );
         }
     } else {
-        println!("{}", value.as_str().unwrap_or_default().escape_default());
+        println!(
+            "{}",
+            value.as_str().map_or_else(
+                || value.to_string(),
+                |value| value.escape_default().to_string()
+            )
+        );
     }
     Ok(())
 }
@@ -47,7 +84,17 @@ pub fn configure(cli: &Cli, action: Option<&ConfigAction>, output: &Output) -> R
     let mut store = Store::open(cli)?;
     match action.unwrap_or(&ConfigAction::List) {
         ConfigAction::List => emit(
-            json!({"codex-bin": value(&store, "codex-bin")?, "default-account": value(&store, "default-account")?}),
+            json!({
+                "codex-bin": value(&store, "codex-bin")?,
+                "default-account": value(&store, "default-account")?,
+                "autoswitch.five-hour-threshold": value(&store, "autoswitch.five-hour-threshold")?,
+                "autoswitch.seven-day-threshold": value(&store, "autoswitch.seven-day-threshold")?,
+                "autoswitch.interval-seconds": value(&store, "autoswitch.interval-seconds")?,
+                "autoswitch.cooldown-seconds": value(&store, "autoswitch.cooldown-seconds")?,
+                "autoswitch.hysteresis-percent": value(&store, "autoswitch.hysteresis-percent")?,
+                "autoswitch.unhealthy-ticks": value(&store, "autoswitch.unhealthy-ticks")?,
+                "autoswitch.supplementary-scopes": value(&store, "autoswitch.supplementary-scopes")?
+            }),
             output,
         ),
         ConfigAction::Path => emit(json!(store.root.join("accounts.json")), output),
@@ -74,11 +121,47 @@ pub fn configure(cli: &Cli, action: Option<&ConfigAction>, output: &Output) -> R
                     crate::commands::select_global(cli, Some(new))?;
                     store = Store::open(cli)?;
                 }
+                "autoswitch.five-hour-threshold" => {
+                    store.data.preferences.autoswitch.five_hour_threshold = new
+                        .parse()
+                        .context("five-hour threshold must be a number")?
+                }
+                "autoswitch.seven-day-threshold" => {
+                    store.data.preferences.autoswitch.seven_day_threshold = new
+                        .parse()
+                        .context("seven-day threshold must be a number")?
+                }
+                "autoswitch.interval-seconds" => {
+                    store.data.preferences.autoswitch.interval_seconds =
+                        new.parse().context("interval seconds must be an integer")?
+                }
+                "autoswitch.cooldown-seconds" => {
+                    store.data.preferences.autoswitch.cooldown_seconds =
+                        new.parse().context("cooldown seconds must be an integer")?
+                }
+                "autoswitch.hysteresis-percent" => {
+                    store.data.preferences.autoswitch.hysteresis_percent =
+                        new.parse().context("hysteresis percent must be a number")?
+                }
+                "autoswitch.unhealthy-ticks" => {
+                    store.data.preferences.autoswitch.unhealthy_ticks =
+                        new.parse().context("unhealthy ticks must be an integer")?
+                }
+                "autoswitch.supplementary-scopes" => {
+                    store.data.preferences.autoswitch.supplementary_scopes = new
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|scope| !scope.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
                 _ => {
                     value(&store, key)?;
                     unreachable!()
                 }
             }
+            store.data.preferences.autoswitch.validate()?;
+            store.save()?;
             emit(value(&store, key)?, output)
         }
         ConfigAction::Unset { key } => {
@@ -89,6 +172,36 @@ pub fn configure(cli: &Cli, action: Option<&ConfigAction>, output: &Output) -> R
                     crate::commands::select_global(cli, Some("default"))?;
                     store = Store::open(cli)?;
                 }
+                "autoswitch.five-hour-threshold" => {
+                    store.data.preferences.autoswitch.five_hour_threshold =
+                        AutoswitchPreferences::default().five_hour_threshold
+                }
+                "autoswitch.seven-day-threshold" => {
+                    store.data.preferences.autoswitch.seven_day_threshold =
+                        AutoswitchPreferences::default().seven_day_threshold
+                }
+                "autoswitch.interval-seconds" => {
+                    store.data.preferences.autoswitch.interval_seconds =
+                        AutoswitchPreferences::default().interval_seconds
+                }
+                "autoswitch.cooldown-seconds" => {
+                    store.data.preferences.autoswitch.cooldown_seconds =
+                        AutoswitchPreferences::default().cooldown_seconds
+                }
+                "autoswitch.hysteresis-percent" => {
+                    store.data.preferences.autoswitch.hysteresis_percent =
+                        AutoswitchPreferences::default().hysteresis_percent
+                }
+                "autoswitch.unhealthy-ticks" => {
+                    store.data.preferences.autoswitch.unhealthy_ticks =
+                        AutoswitchPreferences::default().unhealthy_ticks
+                }
+                "autoswitch.supplementary-scopes" => store
+                    .data
+                    .preferences
+                    .autoswitch
+                    .supplementary_scopes
+                    .clear(),
                 _ => {
                     value(&store, key)?;
                     unreachable!()

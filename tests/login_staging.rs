@@ -226,7 +226,9 @@ fn fake_login_child() {
     );
     fs::write(home.join("ready"), std::process::id().to_string()).unwrap();
     let release = PathBuf::from(control).join("release");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // A contended Linux lease may inspect every process descriptor before purge
+    // reports the holder; keep the synthetic login alive through that bounded scan.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !release.exists() {
         assert!(Instant::now() < deadline, "fake sign-in was not released");
         thread::sleep(Duration::from_millis(10));

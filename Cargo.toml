@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Account-specific Codex launches with shared conversation history"
 license = "MIT"
-repository = "https://github.com/maddada/codex-swap"
+repository = "https://github.com/mattdone-ai/codex-swap"
 readme = "README.md"
 
 [[bin]]

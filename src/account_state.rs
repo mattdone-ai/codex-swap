@@ -2,7 +2,7 @@ use crate::{
     auth,
     cli::Cli,
     fsutil, launch, sharing,
-    store::{Account, Store},
+    store::{Account, Store, require_registered_identity},
 };
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -448,9 +448,40 @@ pub fn snapshot(
     Ok(number)
 }
 
+pub(crate) struct ActivationGuard {
+    pub source: auth::Identity,
+    pub target: auth::Identity,
+    pub target_number: u32,
+    pub autoswitch: crate::store::AutoswitchPreferences,
+}
+
 pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
-    let mut store = Store::open(cli)?;
+    select_global_impl(cli, identifier, cli.stop_policy(), None)
+}
+
+pub(crate) fn select_global_guarded(cli: &Cli, guard: &ActivationGuard) -> Result<()> {
+    let target = guard.target_number.to_string();
+    select_global_impl(
+        cli,
+        Some(&target),
+        crate::cli::StopCodex::Never,
+        Some(guard),
+    )
+}
+
+fn select_global_impl(
+    cli: &Cli,
+    identifier: Option<&str>,
+    stop_policy: crate::cli::StopCodex,
+    guard: Option<&ActivationGuard>,
+) -> Result<()> {
+    let mut store = Store::open_with_stop_policy(cli, stop_policy)?;
     launch::validate_file_store(&store.data.main_home)?;
+    if let Some(guard) = guard {
+        let source = auth::identity(&store.data.main_home)?
+            .context("the active Codex login disappeared before automatic switching")?;
+        validate_activation_guard(&store, &source, guard)?;
+    }
     let live = store.live_account()?;
     let selected = match identifier {
         Some("default") => store
@@ -502,7 +533,7 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
             selected.number
         );
     }
-    crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
+    crate::platform::ensure_codex_stopped(&store.codex_bin(cli), stop_policy)?;
     let mut homes: std::collections::BTreeSet<_> =
         store.data.accounts.iter().map(|a| a.home.clone()).collect();
     homes.insert(store.data.main_home.clone());
@@ -511,6 +542,9 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
         .map(|home| store.lease(home, true))
         .collect::<Result<_>>()?;
     let original_live = fsutil::optional_bytes(&store.data.main_home.join("auth.json"))?;
+    if let Some(guard) = guard {
+        validate_activation_snapshot(&store, original_live.as_deref(), guard)?;
+    }
     let mut transaction = Transaction::new();
     let result = (|| {
         migrate_original(&mut store, &mut transaction)?;
@@ -520,7 +554,7 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
         }
         let selected = store.resolve(&selected.number.to_string())?;
         let (document, identity) = auth::verified_credentials(&selected.home, &selected.identity)?;
-        crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
+        crate::platform::ensure_codex_stopped(&store.codex_bin(cli), stop_policy)?;
         if fsutil::optional_bytes(&store.data.main_home.join("auth.json"))? != original_live {
             bail!("the current Codex login changed during switching; stop Codex and retry");
         }
@@ -537,6 +571,130 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
         transaction.write(&store.root.join("accounts.json"), &store.data)
     })();
     transaction.finish(result)
+}
+
+fn validate_activation_guard(
+    store: &Store,
+    source: &auth::Identity,
+    guard: &ActivationGuard,
+) -> Result<()> {
+    if !source.same_owner(&guard.source) {
+        bail!("the active Codex identity changed before automatic switching");
+    }
+    if store.data.preferences.autoswitch != guard.autoswitch {
+        bail!("autoswitch configuration changed before activation; retrying with the new policy");
+    }
+    let target = store.resolve(&guard.target_number.to_string())?;
+    if !target.enabled {
+        bail!("the autoswitch target was disabled before activation");
+    }
+    let identity = require_registered_identity(target.number, &target.identity)?;
+    if !identity.same_owner(&guard.target) {
+        bail!("the autoswitch target identity changed before activation");
+    }
+    Ok(())
+}
+
+fn validate_activation_snapshot(
+    store: &Store,
+    bytes: Option<&[u8]>,
+    guard: &ActivationGuard,
+) -> Result<()> {
+    let bytes = bytes.context("the active Codex login disappeared before automatic activation")?;
+    let (_, source) = auth::credentials_from_bytes(bytes)?;
+    validate_activation_guard(store, &source, guard)
+}
+
+#[cfg(test)]
+mod activation_guard_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
+
+    fn identity(number: u32) -> auth::Identity {
+        auth::Identity {
+            account_id: format!("workspace-{number}"),
+            user_id: Some(format!("user-{number}")),
+            email: Some(format!("user-{number}@example.test")),
+            plan: None,
+            legacy_hint_unusable: false,
+        }
+    }
+
+    fn credentials(number: u32) -> Vec<u8> {
+        let payload = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"email":"user-{number}@example.test","https://api.openai.com/auth":{{"chatgpt_user_id":"user-{number}"}}}}"#
+        ));
+        serde_json::to_vec(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "account_id": format!("workspace-{number}"),
+                "access_token": "synthetic-access",
+                "refresh_token": "synthetic-refresh",
+                "id_token": format!("e30.{payload}.synthetic")
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn guard_rejects_identity_policy_and_enabled_state_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(directory.path().join("data")),
+            codex_home: Some(directory.path().join("main")),
+            codex_bin: None,
+            stop_codex: true,
+            command: crate::cli::Action::List(crate::cli::Output { json: false }),
+        };
+        let mut store = Store::open(&cli).unwrap();
+        let source = identity(1);
+        let target = identity(2);
+        store.data.accounts.push(Account {
+            number: 2,
+            alias: None,
+            home: directory.path().join("target"),
+            managed: true,
+            share_history: false,
+            identity: Some(target.clone()),
+            enabled: true,
+        });
+        let guard = ActivationGuard {
+            source: source.clone(),
+            target: target.clone(),
+            target_number: 2,
+            autoswitch: store.data.preferences.autoswitch.clone(),
+        };
+        validate_activation_guard(&store, &source, &guard).unwrap();
+        validate_activation_snapshot(&store, Some(&credentials(1)), &guard).unwrap();
+        assert!(
+            validate_activation_snapshot(&store, Some(&credentials(3)), &guard)
+                .unwrap_err()
+                .to_string()
+                .contains("active Codex identity changed")
+        );
+        assert!(
+            validate_activation_guard(&store, &identity(3), &guard)
+                .unwrap_err()
+                .to_string()
+                .contains("active Codex identity changed")
+        );
+        store.data.accounts[0].enabled = false;
+        assert!(
+            validate_activation_guard(&store, &source, &guard)
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        );
+        store.data.accounts[0].enabled = true;
+        store.data.preferences.autoswitch.cooldown_seconds += 1;
+        assert!(
+            validate_activation_guard(&store, &source, &guard)
+                .unwrap_err()
+                .to_string()
+                .contains("configuration changed")
+        );
+    }
 }
 
 #[cfg(test)]

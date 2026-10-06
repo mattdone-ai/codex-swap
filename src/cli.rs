@@ -64,6 +64,8 @@ pub enum Action {
         #[command(flatten)]
         output: Output,
     },
+    /// Poll account quotas and switch when configured limits are reached.
+    Auto(Auto),
     /// Set or clear an account alias.
     #[command(visible_alias = "alias")]
     Rename {
@@ -218,6 +220,19 @@ pub struct Add {
     pub share_history: bool,
     #[command(flatten)]
     pub output: Output,
+}
+
+#[derive(Args)]
+pub struct Auto {
+    /// Evaluate one poll and exit instead of running continuously.
+    #[arg(long)]
+    pub once: bool,
+    /// Report the decision without changing the active account.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Emit one JSON object per line.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]

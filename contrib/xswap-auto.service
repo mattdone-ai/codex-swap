@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Swap automatic account rotation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env xswap auto --json
+Restart=always
+RestartSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target
